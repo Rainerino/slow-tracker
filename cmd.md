@@ -2,7 +2,7 @@ calibration
 
 ```bash
 sh shfiles/rspx4.sh
-roslaunch vins viz.launch
+roslaunch vins rviz.launch
 
 ```
 
