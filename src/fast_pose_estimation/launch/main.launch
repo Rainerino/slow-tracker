@@ -1,0 +1,14 @@
+<launch>
+
+	<node pkg="fast_pose_estimation" type="main.py" name="fast_pose_est" output="screen">
+        	<!-- <remap from="~odom" to="/vicon_imu_ekf_odom" /> -->
+			
+			<!-- <remap from="~odom" to="/vins_fusion/imu_propagate" />
+
+		<remap from="~cmd" to="/position_cmd" />
+
+        <rosparam command="load" file="$(find px4ctrl)/config/ctrl_param_fpv.yaml" /> -->
+	</node>
+ 
+ <include file="$(find realsense2_camera)/launch/rs_camera.launch"/>
+</launch>
