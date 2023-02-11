@@ -9,6 +9,7 @@
 
         <rosparam command="load" file="$(find px4ctrl)/config/ctrl_param_fpv.yaml" /> -->
 	</node>
- 
+  <include file="$(find vins)/launch/fast_drone_250.launch"/>
+  <include file="$(find mavros)/launch/px4.launch"/>
  <include file="$(find realsense2_camera)/launch/rs_camera.launch"/>
 </launch>
