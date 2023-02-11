@@ -1,0 +1,4 @@
+build/
+devel/
+glog/
+ceres-solver-2.0.0rc1/
