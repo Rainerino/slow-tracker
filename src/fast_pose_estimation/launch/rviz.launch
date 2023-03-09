@@ -1,3 +1,3 @@
 <launch>
-	<node name="rviz" pkg="rviz"  type="rviz" output="screen" args="-d $(find fast_pose_estimation)/launch/pose.rviz"/>
+	<node name="rviz" pkg="rviz"  type="rviz" output="screen" args="-d $(find fast_pose_estimation)/launch/vins_rviz_config.rviz"/>
 </launch> 

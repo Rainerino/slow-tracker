@@ -3,6 +3,7 @@ import rospy as ros
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import Odometry
 import mediapipe as mp
 import cv2
 import tf2_ros
@@ -14,34 +15,80 @@ WORLD_FRAME_ID = "world"
 BGR = "bgr8"
 
 class FastPoseEstimator:
-    def __init__(self, pose_rate: float=10.0, visibility_threshold: float = 0.1, debug_mode=False):
+    def __init__(self, pose_rate: float=5.0, goal_rate: float=1.0,  visibility_threshold: float = 0.1, debug_mode=False):
         self.pose_pub_timer = ros.get_time()
         self.depth_update_timer = ros.get_time()
+        self.goal_pub_timer = ros.get_time()
         
-        # subscriber
+        # Subscriber
         ros.Subscriber("camera/color/image_raw", Image, self.mediapipe_pose_callback)
         ros.Subscriber("camera/aligned_depth_to_color/image_raw", Image, self.depth_estimator_callback)
-        
+        ros.Subscriber(f"{ros.get_name()}/head", PoseStamped, self.set_goal_callback)
+        ros.Subscriber("vins_fusion/odometry", Odometry, self.update_odom)
 
-        # publisher
-        self.left_hand_pub = ros.Publisher(f"{ros.get_name()}/left_hand", PoseStamped, queue_size=10)
-        self.right_hand_pub = ros.Publisher(f"{ros.get_name()}/right_hand", PoseStamped, queue_size=10)
+        # Publisher
+        self.head_pose_pub = ros.Publisher(f"{ros.get_name()}/head", PoseStamped, queue_size=10)
         self.img_pub = ros.Publisher(f"{ros.get_name()}/image_pose", Image, queue_size=1)
+        self.goal_pub = ros.Publisher("move_base_simple/goal", PoseStamped, queue_size=1)
+
         self.cv_bridge = CvBridge()
 
+        # Config
         self.pose_rate=pose_rate
         self.visibility_threshold=visibility_threshold
         self.debug_mode = debug_mode
+        self.goal_rate = goal_rate
 
         self.mp_pose = mp.solutions.pose.Pose(min_detection_confidence=0.5, enable_segmentation=True, min_tracking_confidence=0.5)
 
-        # Intermediate variables.
+        # Intermediate variables, care for race conditions. 
         self.pose_mask = np.array([])
         self.masked_depth_map = np.array([])
+        self.odom = PoseStamped()
+        self.next_goal_odom = PoseStamped()
 
         # TF related.
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_1listener = tf2_ros.TransformListener(self.tf_buffer)
+
+    def update_odom(self, odom_msg: Odometry) -> None:
+        if ros.get_time() -  self.goal_pub_timer > 1/ self.goal_rate:
+            self.goal_pub_timer = ros.get_time()
+            self.odom.pose = odom_msg.pose.pose
+            self.goal_pub.publish(self.next_goal_odom)
+
+    def set_goal_callback(self, target_pose_msg: PoseStamped) -> None:
+        goal_pose_msg = PoseStamped()
+        goal_pose_msg.header.frame_id = WORLD_FRAME_ID
+        target_pose = np.array([target_pose_msg.pose.position.x, target_pose_msg.pose.position.y, target_pose_msg.pose.position.z])
+
+        # target_ori = np.array([pose.pose.orientation.w, pose.pose.orientation.x, pose.pose.orientation.y, pose.pose.orientation.z])
+        cur_pose = np.array([self.odom.pose.position.x, self.odom.pose.position.y, self.odom.pose.position.z])
+        cur_heading = np.array([self.odom.pose.orientation.w, self.odom.pose.orientation.x, self.odom.pose.orientation.y, self.odom.pose.orientation.z])   
+        
+        # Get vector to target in 2D
+        target_pose[2] = 0
+        cur_pose[2] = 0
+        target_vec = target_pose - cur_pose
+        target_yaw_rad = np.arctan2(target_vec[0], target_vec[1])
+        
+        ros.loginfo(f"{target_yaw_rad}")
+        to_target_ori = transformations.quaternion_from_euler(0, 0, -target_yaw_rad+np.pi/2)
+
+        goal_pose = target_pose - target_vec * 2
+        
+        goal_pose_msg.pose.orientation.x = to_target_ori[0]
+        goal_pose_msg.pose.orientation.y = to_target_ori[1]
+        goal_pose_msg.pose.orientation.z = to_target_ori[2]
+        goal_pose_msg.pose.orientation.w = to_target_ori[3]
+
+        # fix the height at 1.5 meters
+        goal_pose_msg.pose.position.x = goal_pose[0]
+        goal_pose_msg.pose.position.y = goal_pose[1]
+        goal_pose_msg.pose.position.z = 1.5
+        # Make the goal to be along the axis
+        self.next_goal_odom = goal_pose_msg
+        
 
     def depth_estimator_callback(self, image: Image) -> None:
         # get depth map and estimate pose
@@ -87,9 +134,9 @@ class FastPoseEstimator:
                     else:
                         self.img_pub.publish(self.cv_bridge.cv2_to_imgmsg(cv2.flip(annotated_img, 1), "bgr8"))
                 except CvBridgeError as e:
-                    ros.logerror(f"error {e}") 
+                    ros.logerror(f"error {e}")
 
-            # change from camera to world frame
+            # Change from camera to world frame.
             try:
                 trans = self.tf_buffer.lookup_transform(WORLD_FRAME_ID, CAMERA_FRAME_ID, ros.Time())
             except tf2_ros.LookupException as e:
@@ -107,27 +154,17 @@ class FastPoseEstimator:
             # TODO: bug here, could receive empty frame
             processing_image = self.masked_depth_map.copy()
             if not np.count_nonzero(processing_image):
+                # No depth image found, skip this frame.
                 return
             normalize = np.sum(processing_image) / np.count_nonzero(processing_image)
             filtered = np.where(processing_image < normalize + HUMAN_WIDTH, processing_image, 0)
-            remapped_depth = (255 - filtered) / 255 / DEPTH_UNITS
-            # remapped_depth = cv2.GaussianBlur(remapped_depth, (5, 5), cv2.BORDER_DEFAULT)
-            # filtered_depth_map = cv2.bilateralFilter(self.masked_depth_map, 15, 80, 80)
-            # depth_estimated = np.average(remapped_depth)
+            remapped_depth = (255 - filtered) / 255 / DEPTH_UNITS # Map from Gray scale uint8 to meters.
+            remapped_depth = cv2.GaussianBlur(remapped_depth, (5, 5), cv2.BORDER_DEFAULT)
             depth_estimated = (np.sum(remapped_depth) / np.count_nonzero(remapped_depth) ) / 10000.0 # TODO: magic number LOL
-            ros.loginfo(f"before {depth_estimated}")
-
-            # ros.loginfo(f"{remapped_depth}")
-            # human_bbox = np.where(self.masked_depth_map < depth_estimated + HUMAN_WIDTH, self.masked_depth_map, 0 )
-            
-            # depth_estimated = np.sum(human_bbox) / np.count_nonzero(human_bbox)
-            # ros.loginfo(f"{depth_estimated}")
 
             # Construct transformation matrix
-            left_hand_pose_msg: PoseStamped = PoseStamped()
-            left_hand_pose_msg.header.frame_id = WORLD_FRAME_ID
-            right_hand_pose_msg: PoseStamped = PoseStamped()
-            right_hand_pose_msg.header.frame_id = WORLD_FRAME_ID
+            head_pose_msg: PoseStamped = PoseStamped()
+            head_pose_msg.header.frame_id = WORLD_FRAME_ID
 
             T = np.zeros((4, 4))
             R = transformations.quaternion_matrix([trans.transform.rotation.w, trans.transform.rotation.x, trans.transform.rotation.y, trans.transform.rotation.z])
@@ -138,21 +175,18 @@ class FastPoseEstimator:
 
             right_hand_pose = np.array([results.pose_world_landmarks.landmark[0].x, results.pose_world_landmarks.landmark[0].y, results.pose_world_landmarks.landmark[0].z, 1.0])
 
-            right_hand_translated = np.matmul(T, right_hand_pose)
+            head_translated = np.matmul(T, right_hand_pose)
 
+            ros.logdebug(f"transformation matrix: {T}, pose {right_hand_pose}, trans {head_translated}")
 
-            # ros.loginfo(f"transformation matrix: {T}, pose {right_hand_pose}, trans {right_hand_translated}")
+            head_pose_world = np.array([depth_estimated, -head_translated[1] * 2, head_translated[0] * 2])
+            ros.loginfo(f"{head_pose_world}")
 
             if results.pose_world_landmarks.landmark[0].visibility > self.visibility_threshold:
-                right_hand_pose_msg.pose.position.x = depth_estimated
-                right_hand_pose_msg.pose.position.y = -right_hand_translated[1] * 2
-                right_hand_pose_msg.pose.position.z = right_hand_translated[0] * 2
-                self.right_hand_pub.publish(right_hand_pose_msg)
-            # if results.pose_world_landmarks.landmark[16].visibility > self.visibility_threshold:
-            #     left_hand_pose_msg.pose.position.x = results.pose_world_landmarks.landmark[16].y*1
-            #     left_hand_pose_msg.pose.position.y = results.pose_world_landmarks.landmark[16].x*1
-            #     left_hand_pose_msg.pose.position.z = results.pose_world_landmarks.landmark[16].z*1
-            #     self.left_hand_pub.publish(left_hand_pose_msg)
+                head_pose_msg.pose.position.x = head_pose_world[0]
+                head_pose_msg.pose.position.y = head_pose_world[1]
+                head_pose_msg.pose.position.z = head_pose_world[2]
+                self.head_pose_pub.publish(head_pose_msg)
 
     
 if __name__=='__main__':
